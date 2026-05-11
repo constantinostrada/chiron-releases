@@ -293,6 +293,49 @@ install_ollama_now() {
   return 0
 }
 
+start_ollama_service() {
+  case "$OS" in
+    darwin)
+      if command_exists brew; then
+        info "Starting Ollama via \`brew services start ollama\`..."
+        if brew services start ollama >/dev/null 2>&1; then
+          # Service registration succeeds quickly; the actual server takes a
+          # moment. Wait up to ~5s for the API to respond before giving up.
+          local attempts=0
+          while [ $attempts -lt 10 ]; do
+            if curl -sf "${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+              return 0
+            fi
+            sleep 0.5
+            attempts=$((attempts + 1))
+          done
+          warn "Service registered but the API didn't respond on ${OLLAMA_HOST}. Check: brew services list"
+          return 1
+        fi
+        warn "\`brew services start ollama\` failed. Start manually with: ollama serve"
+        return 1
+      fi
+      warn "Homebrew not available. Start manually with: ollama serve"
+      return 1
+      ;;
+    linux)
+      if command_exists systemctl && systemctl list-unit-files 2>/dev/null | grep -q '^ollama'; then
+        info "Starting Ollama via systemctl..."
+        if sudo systemctl start ollama >/dev/null 2>&1; then
+          sleep 2
+          return 0
+        fi
+      fi
+      warn "Couldn't auto-start. Start manually in another terminal with: ollama serve"
+      return 1
+      ;;
+    *)
+      warn "Auto-start not supported on this OS. Start manually with: ollama serve"
+      return 1
+      ;;
+  esac
+}
+
 pull_ollama_model() {
   info "Pulling ${OLLAMA_MODEL} model (~270MB, takes a minute)..."
   if ollama pull "$OLLAMA_MODEL"; then
@@ -323,13 +366,28 @@ handle_ollama() {
       ;;
     installed_not_running)
       printf "\n${BOLD}${YELLOW}ℹ${RESET} ${BOLD}Ollama is installed but not running.${RESET}\n"
-      printf "  Start it with one of these:\n"
-      if [ "$OS" = "darwin" ]; then
-        printf "    ${CYAN}brew services start ollama${RESET}   ${DIM}(background)${RESET}\n"
+      printf "  ${DIM}The daemon talks to Ollama over localhost:11434 for vector search.${RESET}\n"
+      printf "  ${DIM}It needs the service running — \`chiron start\` won't start it for you.${RESET}\n"
+      prompt_yn "Start it now in the background?" "y"
+      if [ "$OLLAMA_REPLY" = "yes" ]; then
+        if start_ollama_service; then
+          ok "Ollama started"
+          # Re-detect: maybe the model is already pulled from a previous run.
+          detect_ollama_state
+          if [ "$OLLAMA_STATE" = "running_no_model" ]; then
+            prompt_yn "Pull ${OLLAMA_MODEL} now? (~270MB)" "y"
+            if [ "$OLLAMA_REPLY" = "yes" ]; then
+              pull_ollama_model
+            fi
+          fi
+        fi
+      else
+        info "Skipping. Start it later with one of these:"
+        if [ "$OS" = "darwin" ]; then
+          printf "    ${CYAN}brew services start ollama${RESET}   ${DIM}(background)${RESET}\n"
+        fi
+        printf "    ${CYAN}ollama serve${RESET}                  ${DIM}(foreground, separate terminal)${RESET}\n"
       fi
-      printf "    ${CYAN}ollama serve${RESET}                  ${DIM}(foreground, separate terminal)${RESET}\n"
-      printf "  Then: ${CYAN}ollama pull ${OLLAMA_MODEL}${RESET}\n"
-      printf "  The daemon will auto-detect Ollama on next startup.\n"
       ;;
     missing)
       printf "\n${BOLD}Optional:${RESET} install Ollama for semantic search.\n"
