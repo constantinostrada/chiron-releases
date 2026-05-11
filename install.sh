@@ -50,11 +50,13 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 # Detect platform
 # ---------------------------------------------------------------------------
 detect_platform() {
-  local os arch
-
+  # OS / ARCH are exposed globally (not `local`) so downstream helpers like
+  # install_ollama_now() can branch on $OS without re-detecting. Under
+  # `set -u` an unset $OS in the Ollama path triggers an "unbound variable"
+  # fatal — we hit that before this fix.
   case "$(uname -s)" in
-    Darwin) os="darwin" ;;
-    Linux)  os="linux" ;;
+    Darwin) OS="darwin" ;;
+    Linux)  OS="linux" ;;
     MINGW*|MSYS*|CYGWIN*)
       fail "Windows is not yet supported by this installer. Download chiron-windows-x64.zip from
    https://github.com/$REPO/releases/latest manually for now." ;;
@@ -63,13 +65,13 @@ detect_platform() {
   esac
 
   case "$(uname -m)" in
-    x86_64|amd64) arch="x64" ;;
-    aarch64|arm64) arch="arm64" ;;
+    x86_64|amd64) ARCH="x64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
     *)
       fail "Unsupported architecture: $(uname -m). Chiron supports x64 and arm64." ;;
   esac
 
-  PLATFORM="${os}-${arch}"
+  PLATFORM="${OS}-${ARCH}"
 }
 
 # ---------------------------------------------------------------------------
