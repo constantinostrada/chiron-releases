@@ -166,6 +166,193 @@ install_binary() {
 }
 
 # ---------------------------------------------------------------------------
+# Ollama detection + optional install
+#
+# Chiron's daemon optionally uses Ollama (running locally) to add vector
+# embeddings on top of keyword search. The daemon auto-detects Ollama at
+# runtime and gracefully falls back to BM25 if it's not reachable — but
+# from the installer's perspective we can shorten the path-to-value by
+# detecting the user's current state and prompting only when useful.
+#
+# The four states we react to:
+#
+#   ready                 — Ollama up + nomic-embed-text pulled. Nothing to do.
+#   running_no_model      — Ollama up but model missing. Offer to pull it.
+#   installed_not_running — Binary on PATH but server not responding. Hint
+#                           the start command instead of re-installing.
+#   missing               — No Ollama at all. Offer to install via the
+#                           platform-native installer (brew on macOS,
+#                           ollama.com script on Linux).
+#
+# Two env vars short-circuit the interactive prompts (for CI / scripted runs):
+#   OLLAMA=skip   → never prompt, never install. Daemon will run BM25-only.
+#   OLLAMA=yes    → assume yes to every prompt (install + pull if needed).
+# ---------------------------------------------------------------------------
+
+OLLAMA_MODEL="${OLLAMA_MODEL:-nomic-embed-text}"
+OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
+
+detect_ollama_state() {
+  if ! command_exists ollama; then
+    OLLAMA_STATE="missing"
+    return
+  fi
+  # Binary present — check whether the daemon HTTP API responds. 2-second
+  # timeout is enough to distinguish "not running" from "starting up".
+  if ! curl -sf -m 2 "$OLLAMA_HOST/api/tags" >/dev/null 2>&1; then
+    OLLAMA_STATE="installed_not_running"
+    return
+  fi
+  # Server is up — check whether our preferred model is present. Match
+  # both bare name and `:tag` variants (e.g. `nomic-embed-text:latest`).
+  local tags
+  tags=$(curl -sf -m 2 "$OLLAMA_HOST/api/tags" 2>/dev/null || echo "")
+  if printf '%s' "$tags" | grep -q "\"name\":\"${OLLAMA_MODEL}"; then
+    OLLAMA_STATE="ready"
+  else
+    OLLAMA_STATE="running_no_model"
+  fi
+}
+
+# Y/N prompt that reads from the controlling terminal (works under
+# `curl | bash` because stdin is the pipe, not the keyboard). Honors
+# the OLLAMA env var to short-circuit interactive runs.
+#
+#   $1 = prompt text
+#   $2 = default ("y" or "n") — what Enter alone means
+#
+# Sets OLLAMA_REPLY to "yes" or "no".
+prompt_yn() {
+  local prompt="$1"
+  local default="$2"
+  local hint
+  case "$default" in
+    y|Y) hint="[Y/n]" ;;
+    *)   hint="[y/N]" ;;
+  esac
+
+  if [ "${OLLAMA:-}" = "skip" ] || [ "${OLLAMA:-}" = "no" ]; then
+    OLLAMA_REPLY="no"
+    return
+  fi
+  if [ "${OLLAMA:-}" = "yes" ]; then
+    OLLAMA_REPLY="yes"
+    return
+  fi
+
+  if [ ! -e /dev/tty ]; then
+    # Non-interactive (e.g. piped without a controlling terminal). Use
+    # the default to keep the install moving rather than hanging.
+    OLLAMA_REPLY=$([ "$default" = "y" ] || [ "$default" = "Y" ] && echo "yes" || echo "no")
+    return
+  fi
+
+  printf "  %s %s " "$prompt" "$hint"
+  local answer
+  read -r answer < /dev/tty || answer=""
+  case "$answer" in
+    y|Y|yes) OLLAMA_REPLY="yes" ;;
+    "")      OLLAMA_REPLY=$([ "$default" = "y" ] || [ "$default" = "Y" ] && echo "yes" || echo "no") ;;
+    *)       OLLAMA_REPLY="no" ;;
+  esac
+}
+
+install_ollama_now() {
+  case "$OS" in
+    darwin)
+      if ! command_exists brew; then
+        warn "Homebrew not found. Install Ollama manually from https://ollama.com,
+   then run: ollama pull ${OLLAMA_MODEL}"
+        return 1
+      fi
+      info "Installing Ollama via Homebrew (this may take a minute)..."
+      brew install ollama >/dev/null 2>&1 || {
+        warn "brew install ollama failed. Install manually from https://ollama.com."
+        return 1
+      }
+      # brew installs a `brew services` agent but doesn't start it.
+      brew services start ollama >/dev/null 2>&1 || true
+      # Give the server a moment to come up before pulling.
+      sleep 2
+      ;;
+    linux)
+      info "Installing Ollama via the official script (https://ollama.com/install.sh)..."
+      if ! curl -fsSL https://ollama.com/install.sh | sh; then
+        warn "Ollama install script failed. Install manually from https://ollama.com."
+        return 1
+      fi
+      ;;
+    *)
+      warn "Unsupported OS for automatic Ollama install. Install manually from https://ollama.com."
+      return 1
+      ;;
+  esac
+  ok "Ollama installed"
+  return 0
+}
+
+pull_ollama_model() {
+  info "Pulling ${OLLAMA_MODEL} model (~270MB, takes a minute)..."
+  if ollama pull "$OLLAMA_MODEL"; then
+    ok "Model ${OLLAMA_MODEL} ready"
+    return 0
+  fi
+  warn "Failed to pull ${OLLAMA_MODEL}. You can retry later with: ollama pull ${OLLAMA_MODEL}"
+  return 1
+}
+
+handle_ollama() {
+  detect_ollama_state
+
+  case "$OLLAMA_STATE" in
+    ready)
+      ok "Ollama detected with ${OLLAMA_MODEL} — semantic search ready"
+      ;;
+    running_no_model)
+      printf "\n${BOLD}? Ollama is running but the ${OLLAMA_MODEL} model isn't pulled yet.${RESET}\n"
+      printf "  ${DIM}This is the model chiron uses for vector search over your knowledge.${RESET}\n"
+      prompt_yn "Pull it now? (~270MB)" "y"
+      if [ "$OLLAMA_REPLY" = "yes" ]; then
+        pull_ollama_model
+      else
+        info "Skipping. The daemon will run BM25-only until you pull it:
+    ollama pull ${OLLAMA_MODEL}"
+      fi
+      ;;
+    installed_not_running)
+      printf "\n${BOLD}${YELLOW}ℹ${RESET} ${BOLD}Ollama is installed but not running.${RESET}\n"
+      printf "  Start it with one of these:\n"
+      if [ "$OS" = "darwin" ]; then
+        printf "    ${CYAN}brew services start ollama${RESET}   ${DIM}(background)${RESET}\n"
+      fi
+      printf "    ${CYAN}ollama serve${RESET}                  ${DIM}(foreground, separate terminal)${RESET}\n"
+      printf "  Then: ${CYAN}ollama pull ${OLLAMA_MODEL}${RESET}\n"
+      printf "  The daemon will auto-detect Ollama on next startup.\n"
+      ;;
+    missing)
+      printf "\n${BOLD}Optional:${RESET} install Ollama for semantic search.\n"
+      printf "  ${DIM}Without Ollama the daemon works fine with keyword search (BM25).${RESET}\n"
+      printf "  ${DIM}Installing it adds local vector embeddings — the agent finds entries${RESET}\n"
+      printf "  ${DIM}by meaning, not just exact words. Runs 100%% on this machine.${RESET}\n"
+      prompt_yn "Install Ollama now?" "n"
+      if [ "$OLLAMA_REPLY" = "yes" ]; then
+        if install_ollama_now; then
+          pull_ollama_model
+        fi
+      else
+        info "Skipping. Install later with:"
+        if [ "$OS" = "darwin" ]; then
+          printf "    ${CYAN}brew install ollama && ollama pull ${OLLAMA_MODEL}${RESET}\n"
+        else
+          printf "    ${CYAN}curl -fsSL https://ollama.com/install.sh | sh${RESET}\n"
+          printf "    ${CYAN}ollama pull ${OLLAMA_MODEL}${RESET}\n"
+        fi
+      fi
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
@@ -190,16 +377,16 @@ Open a new terminal or re-source your shell config to pick it up."
   printf "${BOLD}${GREEN}  ✓ Chiron daemon is ready!${RESET}\n"
   printf "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n\n"
 
-  printf "${BOLD}Next step:${RESET} pair this daemon with your manager.\n"
+  # Detect Ollama state + interactive prompts. Skipped entirely when the
+  # user sets OLLAMA=skip; default-y vs default-n depends on current state.
+  handle_ollama
+
+  printf "\n${BOLD}Next step:${RESET} pair this daemon with your manager.\n"
   printf "  1. Open your Chiron board in a browser.\n"
   printf "  2. Click ${CYAN}+ New Agent${RESET} → ${CYAN}Local runtime (daemon)${RESET}.\n"
   printf "  3. Walk through Name → GitHub → Project → ${BOLD}Pair Daemon${RESET}.\n"
   printf "  4. Copy the ${CYAN}chiron setup --code … --server …${RESET} line and run it here.\n"
   printf "  5. Then run ${CYAN}chiron start${RESET} to begin polling for tasks.\n\n"
-
-  printf "${BOLD}Optional:${RESET} enable local semantic search over your knowledge\n"
-  printf "  ${CYAN}brew install ollama && ollama pull nomic-embed-text${RESET}\n"
-  printf "  ${DIM}(Without Ollama the daemon still works using BM25-only keyword search.)${RESET}\n\n"
 }
 
 main "$@"
